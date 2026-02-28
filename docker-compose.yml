@@ -1,0 +1,251 @@
+# CI Security Tooling Stack
+# Services: DefectDojo, Dependency-Track, MinIO, Harbor
+# Run: docker compose -f ci-infra/docker-compose.yml up -d
+#
+# Access after startup:
+#   DefectDojo       → http://localhost:8080  (admin / set on first login)
+#   Dependency-Track → http://localhost:8081  (admin / admin)
+#   MinIO Console    → http://localhost:9001  (minioadmin / minioadmin)
+#   MinIO API        → http://localhost:9000
+#   Registry UI      → http://localhost:8443
+#   Registry API     → http://localhost:5050
+
+services:
+
+  # ─── DefectDojo ─────────────────────────────────────────────────────────────
+
+  defectdojo-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: defectdojo
+      POSTGRES_USER: defectdojo
+      POSTGRES_PASSWORD: defectdojo_pass
+    volumes:
+      - defectdojo-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U defectdojo -d defectdojo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  defectdojo-rabbitmq:
+    image: rabbitmq:3-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: defectdojo
+      RABBITMQ_DEFAULT_PASS: defectdojo_pass
+    volumes:
+      - defectdojo-rmq:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  defectdojo-initializer:
+    image: defectdojo/defectdojo-django:2.38.1
+    platform: linux/amd64
+    depends_on:
+      defectdojo-db:
+        condition: service_healthy
+      defectdojo-rabbitmq:
+        condition: service_healthy
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        cd /app
+        python manage.py migrate
+        python manage.py createsuperuser \
+          --username admin \
+          --email admin@local.dev \
+          --noinput || true
+        python manage.py loaddata initial_banner_conf || true
+        python manage.py buildwatson || true
+    environment: &dojo-env
+      DD_DATABASE_ENGINE: django.db.backends.postgresql
+      DD_DATABASE_HOST: defectdojo-db
+      DD_DATABASE_PORT: "5432"
+      DD_DATABASE_NAME: defectdojo
+      DD_DATABASE_USER: defectdojo
+      DD_DATABASE_PASSWORD: defectdojo_pass
+      DD_CELERY_BROKER_URL: amqp://defectdojo:defectdojo_pass@defectdojo-rabbitmq:5672//
+      DD_SECRET_KEY: "change-me-in-production-use-random-string"
+      DD_CREDENTIAL_AES_256_KEY: "change-me-32-chars-long-string!!"
+      DJANGO_SUPERUSER_PASSWORD: admin
+      DD_ALLOWED_HOSTS: "*"
+
+  defectdojo-web:
+    image: defectdojo/defectdojo-django:2.38.1
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on:
+      defectdojo-initializer:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8081"
+    environment:
+      <<: *dojo-env
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8081/login?next=/')\" || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  defectdojo-celery-beat:
+    image: defectdojo/defectdojo-django:2.38.1
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on:
+      defectdojo-initializer:
+        condition: service_completed_successfully
+    environment:
+      <<: *dojo-env
+    command: >
+      bash -c "cd /app &&
+      celery -A dojo beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler"
+
+  defectdojo-celery-worker:
+    image: defectdojo/defectdojo-django:2.38.1
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on:
+      defectdojo-initializer:
+        condition: service_completed_successfully
+    environment:
+      <<: *dojo-env
+    command: >
+      bash -c "cd /app &&
+      celery -A dojo worker -l info --concurrency 2"
+
+  # ─── Dependency-Track ───────────────────────────────────────────────────────
+
+  dtrack-apiserver:
+    image: dependencytrack/apiserver:4.11.4
+    platform: linux/amd64
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    environment:
+      ALPINE_DATABASE_MODE: external
+      ALPINE_DATABASE_URL: jdbc:postgresql://dtrack-db:5432/dtrack
+      ALPINE_DATABASE_DRIVER: org.postgresql.Driver
+      ALPINE_DATABASE_USERNAME: dtrack
+      ALPINE_DATABASE_PASSWORD: dtrack_pass
+    volumes:
+      - dtrack-data:/data
+    depends_on:
+      dtrack-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/api/version || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  dtrack-frontend:
+    image: dependencytrack/frontend:4.11.4
+    platform: linux/amd64
+    restart: unless-stopped
+    ports:
+      - "8082:8080"
+    environment:
+      API_BASE_URL: http://localhost:8081
+    depends_on:
+      dtrack-apiserver:
+        condition: service_healthy
+
+  dtrack-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dtrack
+      POSTGRES_USER: dtrack
+      POSTGRES_PASSWORD: dtrack_pass
+    volumes:
+      - dtrack-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dtrack -d dtrack"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ─── MinIO (Object Storage for CI Reports) ─────────────────────────────────
+
+  minio:
+    image: minio/minio:RELEASE.2024-06-13T22-53-53Z
+    restart: unless-stopped
+    ports:
+      - "9000:9000"     # S3 API
+      - "9001:9001"     # Console UI
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb local/ci-reports --ignore-existing;
+      mc anonymous set download local/ci-reports;
+      echo 'MinIO bucket ci-reports created';
+      "
+
+  # ─── Container Registry ────────────────────────────────────────────────────
+  # Using Docker Registry for local CI testing.
+  # To switch to Harbor in production, use Harbor's official installer:
+  #   https://goharbor.io/docs/latest/install-config/
+  # Harbor requires its installer to generate configs, TLS certs, and
+  # inter-service secrets — it cannot run as standalone containers.
+
+  registry:
+    image: registry:2
+    restart: unless-stopped
+    ports:
+      - "5050:5000"
+    environment:
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+    volumes:
+      - registry-data:/var/lib/registry
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:5000/v2/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  registry-ui:
+    image: joxit/docker-registry-ui:2.5.7
+    restart: unless-stopped
+    ports:
+      - "8443:80"
+    environment:
+      REGISTRY_TITLE: "CI Container Registry"
+      REGISTRY_URL: http://registry:5000
+      SINGLE_REGISTRY: "true"
+      DELETE_IMAGES: "true"
+    depends_on:
+      registry:
+        condition: service_healthy
+
+volumes:
+  defectdojo-pgdata:
+  defectdojo-rmq:
+  dtrack-data:
+  dtrack-pgdata:
+  minio-data:
+  registry-data:
