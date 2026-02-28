@@ -1,10 +1,11 @@
 # CI Security Tooling Stack
-# Services: DefectDojo, Dependency-Track, MinIO, Harbor
-# Run: docker compose -f ci-infra/docker-compose.yml up -d
+# Services: DefectDojo, Dependency-Track, MinIO, Docker Registry
+# Run: cd 5-ci-infra && docker compose up -d
 #
-# Access after startup:
-#   DefectDojo       → http://localhost:8080  (admin / set on first login)
-#   Dependency-Track → http://localhost:8081  (admin / admin)
+# Access after startup (~90s for healthchecks):
+#   DefectDojo       → http://localhost:8080  (admin / admin)
+#   Dep-Track UI     → http://localhost:8082  (admin / admin)
+#   Dep-Track API    → http://localhost:8081
 #   MinIO Console    → http://localhost:9001  (minioadmin / minioadmin)
 #   MinIO API        → http://localhost:9000
 #   Registry UI      → http://localhost:8443
